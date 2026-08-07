@@ -1,9 +1,10 @@
 """Бот-трендолог для контент-ниш (RU + US рынок) с оффером Джин-клуба.
 
-Пользователь пишет свою нишу -> бот ищет свежие тренды контента через Tavily
-(веб-поиск) отдельно для российского и американского рынка, затем ИИ
-(через ProxyAPI) собирает по 10 трендов на каждый рынок с примером под нишу.
-Первая ниша — бесплатно, дальше бот показывает фиксированный оффер Джин-клуба.
+Пользователь пишет свою нишу -> бот ищет свежие тренды коротких видео через
+Tavily (веб-поиск) отдельно для российского и американского рынка, затем ИИ
+(через ProxyAPI) собирает по 5 трендов на каждый рынок со ссылкой-референсом
+и идеей адаптации под нишу. Лимит — 3 подборки в сутки на пользователя,
+после каждой подборки — приглашение в Genie Club.
 """
 
 import asyncio
@@ -11,7 +12,9 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, CommandStart
@@ -33,6 +36,10 @@ ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
 }
 
+DAILY_LIMIT = 3
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+TRENDS_PER_MARKET = 5
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trend_bot")
 
@@ -49,7 +56,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ═══════════════════════════════════════════════════════════════
-# ХРАНЕНИЕ СОСТОЯНИЯ (кто уже использовал бесплатную нишу)
+# ХРАНЕНИЕ СОСТОЯНИЯ — сколько подборок пользователь получил сегодня.
 # Простой JSON-файл — этого достаточно для лид-магнита.
 # После редеплоя на Railway файл сбрасывается (диск эфемерный) —
 # для постоянного хранения между релизами нужна база данных (Postgres/Railway Volume).
@@ -77,13 +84,30 @@ def save_state(state: dict) -> None:
 STATE = load_state()
 
 
-def has_used_free_niche(user_id: int) -> bool:
-    return STATE.get(str(user_id), {}).get("used_free", False)
+def today_str() -> str:
+    return datetime.now(MOSCOW_TZ).date().isoformat()
 
 
-def mark_used_free_niche(user_id: int, niche: str) -> None:
-    STATE[str(user_id)] = {"used_free": True, "niche": niche}
+def check_quota(user_id: int) -> tuple[bool, int]:
+    """Возвращает (можно ли делать запрос, сколько подборок уже использовано сегодня)."""
+    entry = STATE.get(str(user_id), {})
+    if entry.get("date") != today_str():
+        return True, 0
+    used = entry.get("count", 0)
+    return used < DAILY_LIMIT, used
+
+
+def use_quota(user_id: int, niche: str) -> int:
+    """Увеличивает счётчик за сегодня, возвращает новое количество использованных подборок."""
+    today = today_str()
+    entry = STATE.get(str(user_id), {})
+    if entry.get("date") != today:
+        entry = {"date": today, "count": 0}
+    entry["count"] = entry.get("count", 0) + 1
+    entry["niche"] = niche
+    STATE[str(user_id)] = entry
     save_state(STATE)
+    return entry["count"]
 
 
 def reset_user(user_id: int) -> None:
@@ -113,15 +137,10 @@ GENIE_PITCH = (
     "Вступить: https://genieclub.tilda.ws/"
 )
 
-FREE_NICHE_INTRO = (
-    "🎁 Это твой бесплатный разбор ниши. Дальше — покажу, как получить безлимит "
-    "по трендам и ещё 20+ ИИ-ботов."
-)
-
-GATE_MESSAGE = (
-    "Бесплатный разбор уже использован ✅\n\n"
-    "Чтобы получать тренды по любым нишам без ограничений — плюс полный "
-    "набор ИИ-ботов для маркетинга — загляни в Genie Club:\n\n" + GENIE_PITCH
+QUOTA_MESSAGE = (
+    f"На сегодня подборки трендов закончились ({DAILY_LIMIT} из {DAILY_LIMIT}) 🙌\n"
+    "Лимит обновится завтра. Если хочешь тренды без ограничений — плюс ещё 20+ ИИ-ботов "
+    "для маркетинга — загляни в Genie Club:\n\n" + GENIE_PITCH
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -134,46 +153,45 @@ TRANSLATE_PROMPT = (
     "Ответь только фразой, без кавычек и пояснений.\nНиша: {niche}"
 )
 
-TRENDS_SYSTEM_PROMPT = """Ты — аналитик по контент-трендам и SMM-стратег с опытом работы на {market_label}.
-Тебе дали нишу и свежие результаты веб-поиска по этой нише (заголовки, сниппеты, ссылки).
-Твоя задача — на их основе выделить 10 РЕАЛЬНЫХ трендов контента, актуальных именно для {market_label} в этой нише.
+TRENDS_SYSTEM_PROMPT = """Ты — аналитик по трендам в коротких видео (Reels/TikTok/Shorts) и SMM-стратег с опытом работы на {market_label}.
+Тебе дали нишу и свежие результаты веб-поиска (заголовки, сниппеты, ссылки).
+
+Собери {n} РЕАЛЬНЫХ трендов коротких видео, которые сейчас на слуху на {market_label}. Тренд не обязан быть придуман специально под нишу пользователя — бери реальные, действительно существующие тренды форматов и механик, а затем отдельно предложи, как его можно адаптировать под нишу «{niche}».
 
 Жёсткие правила:
-- Опирайся на предоставленные результаты поиска. Если для какого-то тренда фактов не хватает — используй устоявшиеся, проверяемые форматы контента для этой ниши и явно не выдумывай несуществующие названия сервисов/функций.
-- Никогда не проси у пользователя лишних уточнений — работай с тем, что дано.
+- Название тренда и факты о нём бери из предоставленных результатов поиска.
+- Поле "Референс" — это URL, СКОПИРОВАННЫЙ БЕЗ ИЗМЕНЕНИЙ из результатов поиска ниже. Никогда не выдумывай и не досочиняй ссылки. Если среди результатов нет прямой ссылки на видео — возьми ссылку на источник, где этот тренд показан или разобран (не выдавай её за прямую ссылку на ролик).
 - Не используй markdown (звёздочки, решётки) — Telegram их не показывает как форматирование.
 - Пиши на русском языке, даже если рынок — американский.
 
-Формат ответа — ровно 10 пунктов, каждый строго по шаблону:
+Формат ответа — ровно {n} пунктов, каждый строго по шаблону:
 
 1. [Название тренда]
-Платформа: [где заходит: Reels/TikTok/Shorts/посты/карусели/подкасты и т.д.]
+Платформа: [Reels/TikTok/Shorts/посты/карусели и т.д.]
+Референс: [URL из результатов поиска]
 Почему заходит: [1-2 предложения — психология или механика формата]
-Пример под нишу «{niche}»: [конкретный, готовый к съёмке/публикации пример именно для этой ниши]
-Как применить: [1 конкретный практический шаг на сегодня]
+Как адаптировать под нишу «{niche}»: [конкретная идея, как переложить этот тренд на нишу пользователя]
 
-(и так далее до пункта 10)
-
-После списка добавь строку "Источники:" и перечисли 3-5 доменов из результатов поиска, на которые ты опирался."""
+(и так далее до пункта {n})"""
 
 TRENDS_USER_PROMPT = """Ниша: {niche}
 Рынок: {market_label}
 
-Результаты веб-поиска по теме (используй как фактическую опору):
+Результаты веб-поиска по теме (используй как фактическую опору, ссылки бери отсюда дословно):
 {context}
 
-Собери 10 трендов строго по формату из системного промпта."""
+Собери {n} трендов строго по формату из системного промпта."""
 
 MARKETS = {
     "ru": {
         "label": "российском рынке контента",
-        "query_tpl": "тренды контента {niche} 2026 соцсети рилс блог",
-        "header": "🇷🇺 ТРЕНДЫ — РОССИЙСКИЙ РЫНОК",
+        "query_tpl": "тренды коротких видео {niche} 2026 рилс тикток shorts примеры",
+        "header": "🇷🇺 ТРЕНДЫ КОРОТКИХ ВИДЕО — РОССИЙСКИЙ РЫНОК",
     },
     "us": {
         "label": "американском рынке контента (US)",
-        "query_tpl": "content marketing trends {niche_en} 2026 TikTok Instagram Reels",
-        "header": "🇺🇸 ТРЕНДЫ — АМЕРИКАНСКИЙ РЫНОК (US)",
+        "query_tpl": "short video content trends {niche_en} 2026 TikTok Instagram Reels examples",
+        "header": "🇺🇸 ТРЕНДЫ КОРОТКИХ ВИДЕО — АМЕРИКАНСКИЙ РЫНОК (US)",
     },
 }
 
@@ -197,7 +215,7 @@ async def translate_niche(niche: str) -> str:
         return niche
 
 
-async def tavily_search(query: str, max_results: int = 6) -> list[dict]:
+async def tavily_search(query: str, max_results: int = 8) -> list[dict]:
     try:
         result = await asyncio.to_thread(
             tavily.search,
@@ -214,7 +232,7 @@ async def tavily_search(query: str, max_results: int = 6) -> list[dict]:
 
 def build_context(results: list[dict]) -> str:
     if not results:
-        return "(поиск не дал результатов — опирайся на общеизвестные устойчивые форматы для этой ниши)"
+        return "(поиск не дал результатов — опирайся на общеизвестные устойчивые форматы коротких видео и честно укажи, что прямой ссылки нет)"
     lines = []
     for r in results:
         title = (r.get("title") or "").strip()
@@ -226,15 +244,17 @@ def build_context(results: list[dict]) -> str:
 
 async def generate_trends(niche: str, market_key: str, context: str) -> str:
     market = MARKETS[market_key]
-    system_prompt = TRENDS_SYSTEM_PROMPT.format(market_label=market["label"], niche=niche)
-    user_prompt = TRENDS_USER_PROMPT.format(niche=niche, market_label=market["label"], context=context)
+    system_prompt = TRENDS_SYSTEM_PROMPT.format(market_label=market["label"], niche=niche, n=TRENDS_PER_MARKET)
+    user_prompt = TRENDS_USER_PROMPT.format(
+        niche=niche, market_label=market["label"], context=context, n=TRENDS_PER_MARKET
+    )
     completion = await ai.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=3000,
+        max_tokens=2200,
         temperature=0.6,
     )
     return completion.choices[0].message.content or "Не получилось собрать тренды, попробуй ещё раз."
@@ -284,6 +304,18 @@ async def keep_typing(chat_id: int, stop_event: asyncio.Event) -> None:
             pass
 
 
+async def send_sequence(chat_id: int, messages: list[str], delay: float = 1.3) -> None:
+    """Отправляет сообщения одно за другим с небольшой паузой — вместо одной стены текста."""
+    for i, text in enumerate(messages):
+        await bot.send_message(chat_id, text)
+        if i < len(messages) - 1:
+            try:
+                await bot.send_chat_action(chat_id, "typing")
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+
+
 # ═══════════════════════════════════════════════════════════════
 # ХЕНДЛЕРЫ
 # ═══════════════════════════════════════════════════════════════
@@ -293,9 +325,10 @@ async def on_start(message: Message):
     await message.answer(
         "Привет! 👋 Я — бот-трендолог.\n\n"
         "Напиши свою нишу (например: «фитнес-тренер», «психолог», «продажа украшений hand-made») — "
-        "и я подберу 10 актуальных трендов контента для российского рынка и 10 — для американского, "
-        "с примером под твою нишу и советом, как применить уже сегодня.\n\n"
-        "Первый разбор — бесплатно 🎁"
+        f"и я подберу {TRENDS_PER_MARKET} трендов коротких видео для российского рынка и "
+        f"{TRENDS_PER_MARKET} — для американского. К каждому тренду — ссылка-референс, почему он заходит "
+        "и как адаптировать его под твою нишу.\n\n"
+        f"Лимит — {DAILY_LIMIT} подборки в сутки 🎁"
     )
 
 
@@ -323,8 +356,9 @@ async def on_message(message: Message):
 
     user_id = message.from_user.id
 
-    if has_used_free_niche(user_id):
-        await message.answer(GATE_MESSAGE)
+    allowed, used_today = check_quota(user_id)
+    if not allowed:
+        await message.answer(QUOTA_MESSAGE)
         return
 
     stop_event = asyncio.Event()
@@ -346,13 +380,24 @@ async def on_message(message: Message):
     stop_event.set()
     await typing_task
 
-    for chunk in split_message(ru_report):
-        await message.answer(chunk)
-    for chunk in split_message(us_report):
-        await message.answer(chunk)
+    used_now = use_quota(user_id, niche)
+    remaining = max(DAILY_LIMIT - used_now, 0)
 
-    mark_used_free_niche(user_id, niche)
-    await message.answer(FREE_NICHE_INTRO + "\n\n" + GENIE_PITCH)
+    sequence: list[str] = []
+    sequence.extend(split_message(ru_report))
+    sequence.append("Продолжаем?")
+    sequence.extend(split_message(us_report))
+    sequence.append("Продолжаем?")
+    sequence.append(GENIE_PITCH)
+    if remaining > 0:
+        sequence.append(
+            "Хочешь ещё подборку трендов? По этой же нише или по другой — просто напиши 🙂\n"
+            f"Осталось подборок сегодня: {remaining}/{DAILY_LIMIT}."
+        )
+    else:
+        sequence.append(f"На сегодня лимит подборок исчерпан ({DAILY_LIMIT}/{DAILY_LIMIT}). Возвращайся завтра 🙂")
+
+    await send_sequence(message.chat.id, sequence)
 
 
 async def main():
