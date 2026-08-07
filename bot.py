@@ -1,10 +1,10 @@
-"""Бот-трендолог для контент-ниш (RU + US рынок) с оффером Джин-клуба.
+"""Бот-трендолог для контент-ниш (российский рынок) с оффером Джин-клуба.
 
 Пользователь пишет свою нишу -> бот ищет через YouTube Data API реальные
-ролики именно по этой нише, отсортированные по числу просмотров (вирусные
-«миллионники» в теме пользователя) — единственный источник ссылок, без
-стороннего веб-поиска. Затем ИИ (через ProxyAPI) собирает до 5 примеров на
-каждый рынок со ссылкой на реальный ролик и идеей, что из него перенять.
+ролики именно по этой нише в России, отсортированные по числу просмотров
+(вирусные «миллионники» в теме пользователя) — единственный источник ссылок,
+без стороннего веб-поиска. Затем ИИ (через ProxyAPI) собирает подборку из
+10 примеров со ссылкой на реальный ролик и идеей, что из него перенять.
 Подборка выдаётся по частям с кнопкой «Продолжаем». Лимит — 3 подборки в
 сутки на пользователя, после каждой — приглашение в Genie Club.
 """
@@ -40,7 +40,11 @@ ADMIN_IDS = {
 
 DAILY_LIMIT = 3
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-TRENDS_PER_MARKET = 5
+TRENDS_COUNT = 10
+
+YOUTUBE_REGION = "RU"
+MARKET_LABEL = "российском рынке контента"
+REPORT_HEADER = "🇷🇺 ТРЕНДЫ КОРОТКИХ ВИДЕО — РОССИЙСКИЙ РЫНОК"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trend_bot")
@@ -149,7 +153,7 @@ QUOTA_MESSAGE = (
 # ═══════════════════════════════════════════════════════════════
 
 TRENDS_SYSTEM_PROMPT = """Ты — аналитик по контенту в нише «{niche}» на {market_label} и SMM-стратег.
-Тебе дали список реальных роликов YouTube именно по этой нише (или близкой тематике) с наибольшим числом просмотров в регионе — настоящие вирусные ролики-«миллионники», которые уже посмотрели тысячи и миллионы людей. Это единственный источник фактов и ссылок, других данных у тебя нет.
+Тебе дали список реальных роликов YouTube именно по этой нише (или близкой тематике) с наибольшим числом просмотров в России — настоящие вирусные ролики-«миллионники», которые уже посмотрели тысячи и миллионы людей. Это единственный источник фактов и ссылок, других данных у тебя нет.
 
 Собери до {n} примеров на основе этого списка. Для каждого объясни, что конкретно в нём сработало (подача, формат, крючок в начале, эмоция, музыка) и как использовать эту же идею в собственных роликах в нише «{niche}».
 
@@ -158,7 +162,7 @@ TRENDS_SYSTEM_PROMPT = """Ты — аналитик по контенту в н�
 - Платформу и формат указывай ровно так, как помечено в списке (Shorts или обычное видео) — не выдумывай и не переименовывай.
 - Если подходящих роликов в списке меньше {n} — верни меньше пунктов, но не выдумывай.
 - Пиши живо и по-человечески, с уместными эмодзи (по 1-2 на пункт) — текст не должен быть сухим. Но не используй markdown-разметку (звёздочки, решётки) — Telegram её не показывает как форматирование.
-- Пиши на русском языке, даже если рынок — американский.
+- Пиши на русском языке.
 
 Формат ответа — от 3 до {n} пунктов, каждый строго по шаблону (эмодзи в начале строк обязательны):
 
@@ -171,25 +175,11 @@ TRENDS_SYSTEM_PROMPT = """Ты — аналитик по контенту в н�
 (и так далее)"""
 
 TRENDS_USER_PROMPT = """Ниша: {niche}
-Рынок: {market_label}
 
-Ролики YouTube по нише с наибольшим числом просмотров в регионе (единственный источник фактов и ссылок, бери дословно):
+Ролики YouTube по нише с наибольшим числом просмотров в России (единственный источник фактов и ссылок, бери дословно):
 {context}
 
 Собери до {n} примеров строго по формату из системного промпта."""
-
-MARKETS = {
-    "ru": {
-        "label": "российском рынке контента",
-        "youtube_region": "RU",
-        "header": "🇷🇺 ТРЕНДЫ КОРОТКИХ ВИДЕО — РОССИЙСКИЙ РЫНОК",
-    },
-    "us": {
-        "label": "американском рынке контента (US)",
-        "youtube_region": "US",
-        "header": "🇺🇸 ТРЕНДЫ КОРОТКИХ ВИДЕО — АМЕРИКАНСКИЙ РЫНОК (US)",
-    },
-}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -207,31 +197,6 @@ def _parse_iso8601_duration(value: str) -> int | None:
 
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
-
-
-async def translate_niche_query(niche: str) -> str:
-    """Короткий перевод ниши на английский для поиска на YouTube (US рынок)."""
-    try:
-        completion = await ai.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Переведи название ниши/тематики на английский язык для поискового "
-                        "запроса YouTube. Ответь только переводом, 2-5 слов, без кавычек и пояснений."
-                    ),
-                },
-                {"role": "user", "content": niche},
-            ],
-            max_tokens=20,
-            temperature=0.2,
-        )
-        translated = (completion.choices[0].message.content or "").strip().strip('"')
-        return translated or niche
-    except Exception as e:
-        log.error("Ошибка перевода ниши: %s", e)
-        return niche
 
 
 async def _youtube_search_and_detail(search_params: dict) -> list[dict]:
@@ -287,17 +252,17 @@ async def _youtube_search_and_detail(search_params: dict) -> list[dict]:
     return items
 
 
-async def fetch_youtube_niche_videos(query: str, region_code: str, market_key: str, max_results: int = 25) -> list[dict]:
-    """Реальные ролики YouTube по конкретной нише, отсортированные по числу просмотров
-    (вирусные «миллионники» в теме пользователя) — единственный источник ссылок для промпта.
+async def fetch_youtube_niche_videos(query: str, max_results: int = 30) -> list[dict]:
+    """Реальные ролики YouTube по конкретной нише в России, отсортированные по числу
+    просмотров (вирусные «миллионники» в теме пользователя) — единственный источник ссылок для промпта.
     """
     base_params = {
         "part": "snippet",
         "type": "video",
         "q": query,
         "order": "viewCount",
-        "regionCode": region_code,
-        "relevanceLanguage": "ru" if market_key == "ru" else "en",
+        "regionCode": YOUTUBE_REGION,
+        "relevanceLanguage": "ru",
         "safeSearch": "none",
         "maxResults": max_results,
         "key": YOUTUBE_API_KEY,
@@ -325,31 +290,26 @@ def format_youtube_trending(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def generate_trends(niche: str, market_key: str, context: str) -> str:
-    market = MARKETS[market_key]
-    system_prompt = TRENDS_SYSTEM_PROMPT.format(market_label=market["label"], niche=niche, n=TRENDS_PER_MARKET)
-    user_prompt = TRENDS_USER_PROMPT.format(
-        niche=niche, market_label=market["label"], context=context, n=TRENDS_PER_MARKET
-    )
+async def generate_trends(niche: str, context: str) -> str:
+    system_prompt = TRENDS_SYSTEM_PROMPT.format(market_label=MARKET_LABEL, niche=niche, n=TRENDS_COUNT)
+    user_prompt = TRENDS_USER_PROMPT.format(niche=niche, context=context, n=TRENDS_COUNT)
     completion = await ai.chat.completions.create(
         model=MODEL_NAME,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=2200,
+        max_tokens=4000,
         temperature=0.6,
     )
     return completion.choices[0].message.content or "Не получилось собрать тренды, попробуй ещё раз."
 
 
-async def build_market_report(niche: str, market_key: str) -> str:
-    market = MARKETS[market_key]
-    search_query = niche if market_key == "ru" else await translate_niche_query(niche)
-    youtube_items = await fetch_youtube_niche_videos(search_query, market["youtube_region"], market_key)
+async def build_report(niche: str) -> str:
+    youtube_items = await fetch_youtube_niche_videos(niche)
     context = format_youtube_trending(youtube_items)
-    body = await generate_trends(niche, market_key, context)
-    return f"{market['header']}\nНиша: {niche}\n\n{body}"
+    body = await generate_trends(niche, context)
+    return f"{REPORT_HEADER}\nНиша: {niche}\n\n{body}"
 
 
 def split_message(text: str, limit: int = 3500) -> list[str]:
@@ -418,9 +378,8 @@ async def on_start(message: Message):
     await message.answer(
         "Привет! 👋 Я — бот-трендолог.\n\n"
         "Напиши свою нишу (например: «фитнес-тренер», «психолог», «продажа украшений hand-made») — "
-        f"и я подберу {TRENDS_PER_MARKET} трендов коротких видео для российского рынка и "
-        f"{TRENDS_PER_MARKET} — для американского. К каждому тренду — ссылка-референс, почему он заходит "
-        "и как адаптировать его под твою нишу.\n\n"
+        f"и я подберу подборку из {TRENDS_COUNT} вирусных роликов по этой нише на российском рынке. "
+        "К каждому — ссылка-референс, почему он заходит и как использовать эту идею в своих роликах.\n\n"
         f"Лимит — {DAILY_LIMIT} подборки в сутки 🎁"
     )
 
@@ -456,13 +415,10 @@ async def on_message(message: Message):
 
     stop_event = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(message.chat.id, stop_event))
-    await message.answer(f"🔎 Ищу тренды для ниши «{niche}» — РФ и США. Это займёт 20-40 секунд...")
+    await message.answer(f"🔎 Ищу тренды для ниши «{niche}» — российский рынок. Это займёт 20-40 секунд...")
 
     try:
-        ru_report, us_report = await asyncio.gather(
-            build_market_report(niche, "ru"),
-            build_market_report(niche, "us"),
-        )
+        report = await build_report(niche)
     except Exception as e:
         log.error("Ошибка генерации трендов: %s", e)
         stop_event.set()
@@ -484,13 +440,12 @@ async def on_message(message: Message):
     else:
         follow_up = f"На сегодня лимит подборок исчерпан ({DAILY_LIMIT}/{DAILY_LIMIT}). Возвращайся завтра 🙂"
 
-    batch_ru = split_message(ru_report)
-    batch_us = split_message(us_report)
+    batch_main = split_message(report)
     batch_final = [GENIE_PITCH, follow_up]
 
-    # Показываем сразу только первую подборку. Остальное — в очереди, ждёт нажатия кнопки.
-    PENDING[user_id] = [batch_us, batch_final]
-    await send_batch(message.chat.id, batch_ru)
+    # Показываем сразу только подборку роликов. Питч и вопрос про ещё одну подборку — после нажатия кнопки.
+    PENDING[user_id] = [batch_final]
+    await send_batch(message.chat.id, batch_main)
     await send_gate(message.chat.id)
 
 
