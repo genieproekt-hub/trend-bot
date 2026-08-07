@@ -1,11 +1,12 @@
 """Бот-трендолог для контент-ниш (RU + US рынок) с оффером Джин-клуба.
 
-Пользователь пишет свою нишу -> бот берёт официальный чарт YouTube Trending
-(реально живые, актуальные ролики по региону — единственный источник трендов,
-без стороннего веб-поиска), затем ИИ (через ProxyAPI) собирает до 5 трендов на
-каждый рынок со ссылкой на реальный ролик и идеей адаптации под нишу. Подборка
-выдаётся по частям с кнопкой «Продолжаем». Лимит — 3 подборки в сутки на
-пользователя, после каждой — приглашение в Genie Club.
+Пользователь пишет свою нишу -> бот ищет через YouTube Data API реальные
+YouTube Shorts (подтверждённая длительность до 3 минут), опубликованные за
+последние 30 дней и набравшие больше всего просмотров в регионе — единственный
+источник трендов, без стороннего веб-поиска. Затем ИИ (через ProxyAPI) собирает
+до 5 трендов на каждый рынок со ссылкой на реальный ролик и идеей адаптации под
+нишу. Подборка выдаётся по частям с кнопкой «Продолжаем». Лимит — 3 подборки в
+сутки на пользователя, после каждой — приглашение в Genie Club.
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -147,21 +148,22 @@ QUOTA_MESSAGE = (
 # ПРОМПТЫ
 # ═══════════════════════════════════════════════════════════════
 
-TRENDS_SYSTEM_PROMPT = """Ты — аналитик по трендам в коротких видео (Reels/TikTok/Shorts) и SMM-стратег с опытом работы на {market_label}.
-Тебе дали список видео из официального чарта YouTube Trending по региону — это реально то, что люди смотрят и снимают прямо сейчас. Это единственный источник фактов и ссылок, других данных у тебя нет.
+TRENDS_SYSTEM_PROMPT = """Ты — аналитик по трендам в коротких видео (YouTube Shorts) и SMM-стратег с опытом работы на {market_label}.
+Тебе дали список реальных роликов YouTube Shorts (подтверждённая длительность до 3 минут, вертикальный формат), опубликованных за последние 30 дней и набравших больше всего просмотров в регионе — это реально то, что прямо сейчас смотрят и снимают. Это единственный источник фактов и ссылок, других данных у тебя нет.
 
-Собери до {n} трендов коротких видео на основе этого списка — идей контента, актуальных для {market_label}. Тренд не обязан изначально относиться к нише пользователя — бери реальные форматы, темы и механики из списка (даже если видео по теме, далёкой от ниши — например, спорт, музыка, новости), а затем отдельно предложи, как адаптировать его под нишу «{niche}».
+Собери до {n} трендов на основе этого списка. В первую очередь выбирай ролики с узнаваемым, повторяемым форматом (челлендж, транзишн, POV, до/после, подборка-листинг, юмористическая сценка, тренд под конкретный звук/музыку) — то, что реально можно повторить. Одиночные новостные ролики, трейлеры фильмов и клипы медиа-каналов без повторяемого формата пропускай, если в списке есть более «форматные» варианты. Тренд не обязан изначально относиться к нише пользователя — бери реальные форматы и механики из списка, а затем отдельно предложи, как адаптировать его под нишу «{niche}».
 
 Жёсткие правила:
-- Название тренда и ссылка в поле "Референс" должны опираться на конкретное видео из списка ниже. Ссылку бери ДОСЛОВНО, никогда не выдумывай и не изменяй ни одного символа в URL.
-- Если подходящих видео в списке меньше {n} — верни меньше пунктов, но не выдумывай.
+- Название тренда и ссылка в поле "Референс" должны опираться на конкретный ролик из списка ниже. Ссылку бери ДОСЛОВНО, никогда не выдумывай и не изменяй ни одного символа в URL.
+- Платформа у всех роликов одна — YouTube Shorts, указывай именно её.
+- Если подходящих роликов в списке меньше {n} — верни меньше пунктов, но не выдумывай.
 - Пиши живо и по-человечески, с уместными эмодзи (по 1-2 на пункт) — текст не должен быть сухим. Но не используй markdown-разметку (звёздочки, решётки) — Telegram её не показывает как форматирование.
 - Пиши на русском языке, даже если рынок — американский.
 
 Формат ответа — от 3 до {n} пунктов, каждый строго по шаблону (эмодзи в начале строк обязательны):
 
 1. [Название тренда] 🔥
-📱 Платформа: [Reels/TikTok/Shorts/YouTube и т.д.]
+📱 Платформа: YouTube Shorts
 🔗 Референс: [URL из списка — дословно]
 💡 Почему заходит: [1-2 живых предложения]
 🎯 Как адаптировать под нишу «{niche}»: [конкретная идея, как переложить этот тренд на нишу пользователя]
@@ -171,7 +173,7 @@ TRENDS_SYSTEM_PROMPT = """Ты — аналитик по трендам в ко�
 TRENDS_USER_PROMPT = """Ниша: {niche}
 Рынок: {market_label}
 
-Видео из YouTube Trending по региону (единственный источник фактов и ссылок, бери дословно):
+Ролики YouTube Shorts за последние 30 дней с наибольшим числом просмотров по региону (единственный источник фактов и ссылок, бери дословно):
 {context}
 
 Собери до {n} трендов строго по формату из системного промпта."""
@@ -203,54 +205,88 @@ def _parse_iso8601_duration(value: str) -> int | None:
     return h * 3600 + mnt * 60 + s
 
 
-async def fetch_youtube_trending(region_code: str, max_results: int = 50) -> list[dict]:
-    """Официальный чарт YouTube «В тренде» по региону — реально живые, актуальные ролики."""
-    params = {
-        "part": "snippet,contentDetails",
-        "chart": "mostPopular",
+async def fetch_youtube_trending_shorts(region_code: str, market_key: str, max_results: int = 25) -> list[dict]:
+    """Реальные YouTube Shorts за последние 30 дней с наибольшим числом просмотров по региону.
+
+    В 2 шага:
+    1) search.list — ищем ролики (videoDuration=short, order=viewCount, publishedAfter=30 дней назад).
+    2) videos.list — подтягиваем точную длительность и просмотры по найденным id и жёстко
+       фильтруем всё, что оказалось длиннее 180 секунд (то есть не настоящий Shorts).
+    """
+    published_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    search_params = {
+        "part": "snippet",
+        "type": "video",
+        "videoDuration": "short",
+        "order": "viewCount",
+        "publishedAfter": published_after,
         "regionCode": region_code,
+        "relevanceLanguage": "ru" if market_key == "ru" else "en",
+        "safeSearch": "none",
         "maxResults": max_results,
         "key": YOUTUBE_API_KEY,
     }
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get("https://www.googleapis.com/youtube/v3/videos", params=params)
-            resp.raise_for_status()
-            data = resp.json()
+            search_resp = await client.get("https://www.googleapis.com/youtube/v3/search", params=search_params)
+            search_resp.raise_for_status()
+            search_data = search_resp.json()
+
+            video_ids = [
+                it["id"]["videoId"]
+                for it in search_data.get("items", [])
+                if it.get("id", {}).get("videoId")
+            ]
+            if not video_ids:
+                return []
+
+            details_params = {
+                "part": "snippet,contentDetails,statistics",
+                "id": ",".join(video_ids),
+                "key": YOUTUBE_API_KEY,
+            }
+            details_resp = await client.get("https://www.googleapis.com/youtube/v3/videos", params=details_params)
+            details_resp.raise_for_status()
+            details_data = details_resp.json()
     except Exception as e:
-        log.error("Ошибка YouTube Trending API (%s): %s", region_code, e)
+        log.error("Ошибка YouTube Shorts API (%s): %s", region_code, e)
         return []
 
     items = []
-    for it in data.get("items", []):
+    for it in details_data.get("items", []):
         vid = it.get("id")
         snippet = it.get("snippet", {})
         content = it.get("contentDetails", {})
+        stats = it.get("statistics", {})
         duration_s = _parse_iso8601_duration(content.get("duration", ""))
-        if not vid:
+        # Держим только реально короткие вертикальные ролики (настоящие Shorts).
+        if not vid or duration_s is None or duration_s > 180:
             continue
         items.append(
             {
                 "title": snippet.get("title", ""),
                 "channel": snippet.get("channelTitle", ""),
-                "url": f"https://www.youtube.com/watch?v={vid}",
+                "url": f"https://www.youtube.com/shorts/{vid}",
+                "views": int(stats.get("viewCount", 0) or 0),
                 "tags": ", ".join((snippet.get("tags") or [])[:6]),
                 "duration_s": duration_s,
-                "is_short": duration_s is not None and duration_s <= 180,
             }
         )
+    items.sort(key=lambda x: x["views"], reverse=True)
     return items
 
 
 def format_youtube_trending(items: list[dict]) -> str:
     if not items:
-        return "(не удалось получить трендовые видео YouTube для этого региона)"
+        return "(не удалось найти трендовые YouTube Shorts за последний месяц для этого региона)"
     lines = []
     for it in items:
-        tag = "Shorts" if it["is_short"] else "видео"
-        dur = f"{it['duration_s']}с" if it["duration_s"] is not None else "?"
+        views = f"{it['views']:,}".replace(",", " ")
         tags_part = f" | теги: {it['tags']}" if it["tags"] else ""
-        lines.append(f"- [{tag}, {dur}] {it['title']} — канал {it['channel']} ({it['url']}){tags_part}")
+        lines.append(
+            f"- [Shorts, {it['duration_s']}с, {views} просмотров] "
+            f"{it['title']} — канал {it['channel']} ({it['url']}){tags_part}"
+        )
     return "\n".join(lines)
 
 
@@ -274,7 +310,7 @@ async def generate_trends(niche: str, market_key: str, context: str) -> str:
 
 async def build_market_report(niche: str, market_key: str) -> str:
     market = MARKETS[market_key]
-    youtube_items = await fetch_youtube_trending(market["youtube_region"])
+    youtube_items = await fetch_youtube_trending_shorts(market["youtube_region"], market_key)
     context = format_youtube_trending(youtube_items)
     body = await generate_trends(niche, market_key, context)
     return f"{market['header']}\nНиша: {niche}\n\n{body}"
