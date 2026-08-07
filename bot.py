@@ -1,11 +1,13 @@
 """Бот-трендолог для контент-ниш (RU + US рынок) с оффером Джин-клуба.
 
-Пользователь пишет свою нишу -> бот ищет через Tavily свежие (последний месяц)
-прямые ссылки на реальные ролики (Instagram/TikTok/YouTube/VK) отдельно для
-российского и американского рынка, затем ИИ (через ProxyAPI) собирает до 5
-трендов на каждый рынок со ссылкой на реальный ролик и идеей адаптации под
-нишу. Подборка выдаётся по частям с кнопкой «Продолжаем». Лимит — 3 подборки
-в сутки на пользователя, после каждой — приглашение в Genie Club.
+Пользователь пишет свою нишу -> бот собирает три слоя данных о трендах:
+1) официальный чарт YouTube Trending (реально живые, актуальные ролики по региону),
+2) веб-поиск Tavily по видеоплощадкам (Instagram/TikTok/YouTube/VK) за последний месяц,
+3) общий контекст (статьи-обзоры трендов) для понимания сути.
+Затем ИИ (через ProxyAPI) собирает до 5 трендов на каждый рынок со ссылкой на
+реальный ролик и идеей адаптации под нишу. Подборка выдаётся по частям с кнопкой
+«Продолжаем». Лимит — 3 подборки в сутки на пользователя, после каждой —
+приглашение в Genie Club.
 """
 
 import asyncio
@@ -17,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -32,6 +35,7 @@ AI_API_KEY = os.getenv("PROXYAPI_KEY") or os.getenv("OPENAI_API_KEY")
 AI_BASE_URL = os.getenv("PROXYAPI_BASE_URL") or "https://api.proxyapi.ru/openai/v1"
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 # Telegram ID Жени (или других админов) через запятую — команда /reset только для них.
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()
@@ -50,6 +54,8 @@ if not AI_API_KEY:
     raise RuntimeError("Не задан PROXYAPI_KEY (или OPENAI_API_KEY) в переменных окружения Railway")
 if not TAVILY_API_KEY:
     raise RuntimeError("Не задан TAVILY_API_KEY в переменных окружения Railway")
+if not YOUTUBE_API_KEY:
+    raise RuntimeError("Не задан YOUTUBE_API_KEY в переменных окружения Railway")
 
 ai = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
 tavily = TavilyClient(api_key=TAVILY_API_KEY)
@@ -155,29 +161,32 @@ TRANSLATE_PROMPT = (
 )
 
 TRENDS_SYSTEM_PROMPT = """Ты — аналитик по трендам в коротких видео (Reels/TikTok/Shorts) и SMM-стратег с опытом работы на {market_label}.
-Тебе дали нишу и два блока результатов веб-поиска: (1) свежие прямые ссылки на ролики с площадок коротких видео за последний месяц и (2) дополнительные статьи/обзоры для контекста.
+Тебе дали нишу и три блока данных (см. ниже, в порядке приоритета):
+1) официальный чарт YouTube Trending по региону — реально живые тренды прямо сейчас, ссылки гарантированно рабочие;
+2) свежие ссылки на ролики из веб-поиска по видеоплощадкам за последний месяц;
+3) дополнительные статьи/обзоры трендов — только для контекста.
 
-Собери до {n} РЕАЛЬНЫХ трендов коротких видео за последний месяц, которые люди сейчас снимают и адаптируют под себя на {market_label}. Тренд не обязан изначально относиться к нише пользователя — бери реальные, действительно существующие тренды форматов и механик, а затем отдельно предложи, как его адаптировать под нишу «{niche}».
+Собери до {n} РЕАЛЬНЫХ трендов коротких видео за последний месяц, которые люди сейчас снимают и адаптируют под себя на {market_label}. Тренд не обязан изначально относиться к нише пользователя — бери реальные, действительно существующие тренды форматов и механик (в том числе из YouTube Trending, даже если ролик по теме, далёкой от ниши — например, спорт, музыка, новости), а затем отдельно предложи, как его адаптировать под нишу «{niche}».
 
-Жёсткие правила:
-- Поле "Референс" заполняй ТОЛЬКО ссылками, дословно скопированными из блоков результатов поиска ниже. Никогда не выдумывай, не досочиняй и не изменяй ни одного символа в URL.
-- В первую очередь бери ссылки из блока «СВЕЖИЕ ССЫЛКИ НА РОЛИКИ» — это прямые ссылки на реально отснятые ролики. Ссылку из блока «ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ» используй только если для тренда совсем нет подходящей ссылки на ролик, и в этом случае прямо помечай в поле «Референс»: «(обзор/статья, не прямой ролик)».
-- Если по какому-то потенциальному тренду вообще нет ни одной подходящей ссылки среди предоставленных результатов — не включай такой тренд в список вообще. Лучше вернуть 3 подтверждённых тренда, чем {n} с неточной или притянутой ссылкой.
-- Бери только тренды, которые по данным поиска актуальны сейчас (последний месяц) — не бери устаревшие форматы.
+Жёсткие правила про ссылки:
+- Поле "Референс" заполняй ТОЛЬКО ссылками, дословно скопированными из блоков данных ниже. Никогда не выдумывай, не досочиняй и не изменяй ни одного символа в URL.
+- Приоритет источников для поля «Референс»: сначала блок 1 (YouTube Trending), затем блок 2 (ссылки на ролики из веб-поиска). Блок 3 (статьи/обзоры) используй для «Референс» только если для тренда совсем нет ссылки на сам ролик — и в этом случае явно пиши в поле: «(обзор/статья, не прямой ролик)».
+- Если по какому-то потенциальному тренду вообще нет ни одной подходящей ссылки среди предоставленных данных — не включай такой тренд в список вообще. Лучше вернуть 3 подтверждённых тренда, чем {n} с неточной или притянутой ссылкой.
+- Бери только тренды, которые по данным актуальны сейчас (последний месяц) — не бери устаревшие форматы.
 - Не используй markdown (звёздочки, решётки) — Telegram их не показывает как форматирование.
 - Пиши на русском языке, даже если рынок — американский.
 
 Формат ответа — от 3 до {n} пунктов, каждый строго по шаблону:
 
 1. [Название тренда]
-Платформа: [Reels/TikTok/Shorts/посты/карусели и т.д.]
-Референс: [URL из результатов поиска — дословно]
+Платформа: [Reels/TikTok/Shorts/YouTube и т.д.]
+Референс: [URL из данных — дословно]
 Почему заходит: [1-2 предложения — психология или механика формата]
 Как адаптировать под нишу «{niche}»: [конкретная идея, как переложить этот тренд на нишу пользователя]
 
 (и так далее)
 
-Если ссылок на ролики по этой нише почти нет — в самом конце добавь отдельную строку: "⚠️ Мало свежих роликов с прямыми ссылками по этой нише — часть трендов дана по обзорам, не по прямым видео." Если ссылки на ролики хорошие — эту строку не добавляй."""
+Если пригодных ссылок по этой нише почти нет — в самом конце добавь отдельную строку: "⚠️ Мало свежих роликов с прямыми ссылками по этой нише — часть трендов дана по обзорам, не по прямым видео." Если ссылки хорошие — эту строку не добавляй."""
 
 TRENDS_USER_PROMPT = """Ниша: {niche}
 Рынок: {market_label}
@@ -191,6 +200,7 @@ MARKETS = {
     "ru": {
         "label": "российском рынке контента",
         "country": "russia",
+        "youtube_region": "RU",
         "video_domains": ["instagram.com", "youtube.com", "vk.com", "rutube.ru", "dzen.ru"],
         "video_query_tpl": "тренд рилс shorts клип {niche} свежий вирусный",
         "context_query_tpl": "тренды коротких видео {niche} этот месяц соцсети",
@@ -199,6 +209,7 @@ MARKETS = {
     "us": {
         "label": "американском рынке контента (US)",
         "country": "united states",
+        "youtube_region": "US",
         "video_domains": ["tiktok.com", "instagram.com", "youtube.com"],
         "video_query_tpl": "TikTok Reels Shorts trend {niche_en} viral this month",
         "context_query_tpl": "short video content trend {niche_en} this month viral",
@@ -224,6 +235,66 @@ async def translate_niche(niche: str) -> str:
     except Exception as e:
         log.warning("Ошибка перевода ниши: %s", e)
         return niche
+
+
+def _parse_iso8601_duration(value: str) -> int | None:
+    """PT#H#M#S -> секунды. Возвращает None, если не удалось разобрать."""
+    m = re.match(r"^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$", value or "")
+    if not m or not any(m.groups()):
+        return None
+    h, mnt, s = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mnt * 60 + s
+
+
+async def fetch_youtube_trending(region_code: str, max_results: int = 50) -> list[dict]:
+    """Официальный чарт YouTube «В тренде» по региону — реально живые, актуальные ролики."""
+    params = {
+        "part": "snippet,contentDetails",
+        "chart": "mostPopular",
+        "regionCode": region_code,
+        "maxResults": max_results,
+        "key": YOUTUBE_API_KEY,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get("https://www.googleapis.com/youtube/v3/videos", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        log.error("Ошибка YouTube Trending API (%s): %s", region_code, e)
+        return []
+
+    items = []
+    for it in data.get("items", []):
+        vid = it.get("id")
+        snippet = it.get("snippet", {})
+        content = it.get("contentDetails", {})
+        duration_s = _parse_iso8601_duration(content.get("duration", ""))
+        if not vid:
+            continue
+        items.append(
+            {
+                "title": snippet.get("title", ""),
+                "channel": snippet.get("channelTitle", ""),
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "tags": ", ".join((snippet.get("tags") or [])[:6]),
+                "duration_s": duration_s,
+                "is_short": duration_s is not None and duration_s <= 180,
+            }
+        )
+    return items
+
+
+def format_youtube_trending(items: list[dict]) -> str:
+    if not items:
+        return "(не удалось получить трендовые видео YouTube для этого региона)"
+    lines = []
+    for it in items:
+        tag = "Shorts" if it["is_short"] else "видео"
+        dur = f"{it['duration_s']}с" if it["duration_s"] is not None else "?"
+        tags_part = f" | теги: {it['tags']}" if it["tags"] else ""
+        lines.append(f"- [{tag}, {dur}] {it['title']} — канал {it['channel']} ({it['url']}){tags_part}")
+    return "\n".join(lines)
 
 
 async def tavily_search(
@@ -256,13 +327,17 @@ def _format_results(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_context(video_results: list[dict], general_results: list[dict]) -> str:
+def build_context(youtube_items: list[dict], video_results: list[dict], general_results: list[dict]) -> str:
     parts = [
-        "СВЕЖИЕ ССЫЛКИ НА РОЛИКИ (Instagram/TikTok/YouTube/VK, последний месяц) — "
-        "приоритетный источник для поля «Референс»:",
+        "1) YOUTUBE TRENDING ПРЯМО СЕЙЧАС (официальный чарт YouTube по региону) — "
+        "САМЫЙ НАДЁЖНЫЙ источник: это реально живые тренды, ссылки гарантированно рабочие:",
+        format_youtube_trending(youtube_items),
+        "",
+        "2) СВЕЖИЕ ССЫЛКИ НА РОЛИКИ ИЗ ВЕБ-ПОИСКА (Instagram/TikTok/YouTube/VK, последний месяц) — "
+        "используй, если в разделе 1 нет подходящего варианта:",
         _format_results(video_results) if video_results else "(прямых ссылок на ролики не найдено)",
         "",
-        "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ (статьи и обзоры трендов — только для понимания сути, "
+        "3) ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ (статьи и обзоры трендов — только для понимания сути, "
         "НЕ для поля «Референс», если выше есть более точная ссылка):",
         _format_results(general_results) if general_results else "(нет дополнительных материалов)",
     ]
@@ -297,11 +372,12 @@ async def build_market_report(niche: str, market_key: str) -> str:
         video_query = market["video_query_tpl"].format(niche=niche)
         context_query = market["context_query_tpl"].format(niche=niche)
 
-    video_results, general_results = await asyncio.gather(
+    youtube_items, video_results, general_results = await asyncio.gather(
+        fetch_youtube_trending(market["youtube_region"]),
         tavily_search(video_query, max_results=10, include_domains=market["video_domains"], country=market["country"]),
         tavily_search(context_query, max_results=6, country=market["country"]),
     )
-    context = build_context(video_results, general_results)
+    context = build_context(youtube_items, video_results, general_results)
     body = await generate_trends(niche, market_key, context)
     return f"{market['header']}\nНиша: {niche}\n\n{body}"
 
