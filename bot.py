@@ -1,10 +1,11 @@
 """Бот-трендолог для контент-ниш (RU + US рынок) с оффером Джин-клуба.
 
-Пользователь пишет свою нишу -> бот ищет свежие тренды коротких видео через
-Tavily (веб-поиск) отдельно для российского и американского рынка, затем ИИ
-(через ProxyAPI) собирает по 5 трендов на каждый рынок со ссылкой-референсом
-и идеей адаптации под нишу. Лимит — 3 подборки в сутки на пользователя,
-после каждой подборки — приглашение в Genie Club.
+Пользователь пишет свою нишу -> бот ищет через Tavily свежие (последний месяц)
+прямые ссылки на реальные ролики (Instagram/TikTok/YouTube/VK) отдельно для
+российского и американского рынка, затем ИИ (через ProxyAPI) собирает до 5
+трендов на каждый рынок со ссылкой на реальный ролик и идеей адаптации под
+нишу. Подборка выдаётся по частям с кнопкой «Продолжаем». Лимит — 3 подборки
+в сутки на пользователя, после каждой — приглашение в Genie Club.
 """
 
 import asyncio
@@ -16,9 +17,9 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from openai import AsyncOpenAI
 from tavily import TavilyClient
 
@@ -154,43 +155,53 @@ TRANSLATE_PROMPT = (
 )
 
 TRENDS_SYSTEM_PROMPT = """Ты — аналитик по трендам в коротких видео (Reels/TikTok/Shorts) и SMM-стратег с опытом работы на {market_label}.
-Тебе дали нишу и свежие результаты веб-поиска (заголовки, сниппеты, ссылки).
+Тебе дали нишу и два блока результатов веб-поиска: (1) свежие прямые ссылки на ролики с площадок коротких видео за последний месяц и (2) дополнительные статьи/обзоры для контекста.
 
-Собери {n} РЕАЛЬНЫХ трендов коротких видео, которые сейчас на слуху на {market_label}. Тренд не обязан быть придуман специально под нишу пользователя — бери реальные, действительно существующие тренды форматов и механик, а затем отдельно предложи, как его можно адаптировать под нишу «{niche}».
+Собери до {n} РЕАЛЬНЫХ трендов коротких видео за последний месяц, которые люди сейчас снимают и адаптируют под себя на {market_label}. Тренд не обязан изначально относиться к нише пользователя — бери реальные, действительно существующие тренды форматов и механик, а затем отдельно предложи, как его адаптировать под нишу «{niche}».
 
 Жёсткие правила:
-- Название тренда и факты о нём бери из предоставленных результатов поиска.
-- Поле "Референс" — это URL, СКОПИРОВАННЫЙ БЕЗ ИЗМЕНЕНИЙ из результатов поиска ниже. Никогда не выдумывай и не досочиняй ссылки. Если среди результатов нет прямой ссылки на видео — возьми ссылку на источник, где этот тренд показан или разобран (не выдавай её за прямую ссылку на ролик).
+- Поле "Референс" заполняй ТОЛЬКО ссылками, дословно скопированными из блоков результатов поиска ниже. Никогда не выдумывай, не досочиняй и не изменяй ни одного символа в URL.
+- В первую очередь бери ссылки из блока «СВЕЖИЕ ССЫЛКИ НА РОЛИКИ» — это прямые ссылки на реально отснятые ролики. Ссылку из блока «ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ» используй только если для тренда совсем нет подходящей ссылки на ролик, и в этом случае прямо помечай в поле «Референс»: «(обзор/статья, не прямой ролик)».
+- Если по какому-то потенциальному тренду вообще нет ни одной подходящей ссылки среди предоставленных результатов — не включай такой тренд в список вообще. Лучше вернуть 3 подтверждённых тренда, чем {n} с неточной или притянутой ссылкой.
+- Бери только тренды, которые по данным поиска актуальны сейчас (последний месяц) — не бери устаревшие форматы.
 - Не используй markdown (звёздочки, решётки) — Telegram их не показывает как форматирование.
 - Пиши на русском языке, даже если рынок — американский.
 
-Формат ответа — ровно {n} пунктов, каждый строго по шаблону:
+Формат ответа — от 3 до {n} пунктов, каждый строго по шаблону:
 
 1. [Название тренда]
 Платформа: [Reels/TikTok/Shorts/посты/карусели и т.д.]
-Референс: [URL из результатов поиска]
+Референс: [URL из результатов поиска — дословно]
 Почему заходит: [1-2 предложения — психология или механика формата]
 Как адаптировать под нишу «{niche}»: [конкретная идея, как переложить этот тренд на нишу пользователя]
 
-(и так далее до пункта {n})"""
+(и так далее)
+
+Если ссылок на ролики по этой нише почти нет — в самом конце добавь отдельную строку: "⚠️ Мало свежих роликов с прямыми ссылками по этой нише — часть трендов дана по обзорам, не по прямым видео." Если ссылки на ролики хорошие — эту строку не добавляй."""
 
 TRENDS_USER_PROMPT = """Ниша: {niche}
 Рынок: {market_label}
 
-Результаты веб-поиска по теме (используй как фактическую опору, ссылки бери отсюда дословно):
+Результаты веб-поиска (используй как фактическую опору, ссылки бери отсюда дословно):
 {context}
 
-Собери {n} трендов строго по формату из системного промпта."""
+Собери до {n} трендов строго по формату из системного промпта."""
 
 MARKETS = {
     "ru": {
         "label": "российском рынке контента",
-        "query_tpl": "тренды коротких видео {niche} 2026 рилс тикток shorts примеры",
+        "country": "russia",
+        "video_domains": ["instagram.com", "youtube.com", "vk.com", "rutube.ru", "dzen.ru"],
+        "video_query_tpl": "тренд рилс shorts клип {niche} свежий вирусный",
+        "context_query_tpl": "тренды коротких видео {niche} этот месяц соцсети",
         "header": "🇷🇺 ТРЕНДЫ КОРОТКИХ ВИДЕО — РОССИЙСКИЙ РЫНОК",
     },
     "us": {
         "label": "американском рынке контента (US)",
-        "query_tpl": "short video content trends {niche_en} 2026 TikTok Instagram Reels examples",
+        "country": "united states",
+        "video_domains": ["tiktok.com", "instagram.com", "youtube.com"],
+        "video_query_tpl": "TikTok Reels Shorts trend {niche_en} viral this month",
+        "context_query_tpl": "short video content trend {niche_en} this month viral",
         "header": "🇺🇸 ТРЕНДЫ КОРОТКИХ ВИДЕО — АМЕРИКАНСКИЙ РЫНОК (US)",
     },
 }
@@ -215,24 +226,27 @@ async def translate_niche(niche: str) -> str:
         return niche
 
 
-async def tavily_search(query: str, max_results: int = 8) -> list[dict]:
+async def tavily_search(
+    query: str,
+    max_results: int = 8,
+    time_range: str = "month",
+    include_domains: list[str] | None = None,
+    country: str | None = None,
+) -> list[dict]:
+    kwargs = dict(query=query, search_depth="advanced", max_results=max_results, time_range=time_range)
+    if include_domains:
+        kwargs["include_domains"] = include_domains
+    if country:
+        kwargs["country"] = country
     try:
-        result = await asyncio.to_thread(
-            tavily.search,
-            query=query,
-            search_depth="advanced",
-            max_results=max_results,
-            days=180,
-        )
+        result = await asyncio.to_thread(tavily.search, **kwargs)
         return result.get("results", [])
     except Exception as e:
         log.error("Ошибка поиска Tavily (%s): %s", query, e)
         return []
 
 
-def build_context(results: list[dict]) -> str:
-    if not results:
-        return "(поиск не дал результатов — опирайся на общеизвестные устойчивые форматы коротких видео и честно укажи, что прямой ссылки нет)"
+def _format_results(results: list[dict]) -> str:
     lines = []
     for r in results:
         title = (r.get("title") or "").strip()
@@ -240,6 +254,19 @@ def build_context(results: list[dict]) -> str:
         content = (r.get("content") or "").strip()[:400]
         lines.append(f"- {title} ({url})\n  {content}")
     return "\n".join(lines)
+
+
+def build_context(video_results: list[dict], general_results: list[dict]) -> str:
+    parts = [
+        "СВЕЖИЕ ССЫЛКИ НА РОЛИКИ (Instagram/TikTok/YouTube/VK, последний месяц) — "
+        "приоритетный источник для поля «Референс»:",
+        _format_results(video_results) if video_results else "(прямых ссылок на ролики не найдено)",
+        "",
+        "ДОПОЛНИТЕЛЬНЫЙ КОНТЕКСТ (статьи и обзоры трендов — только для понимания сути, "
+        "НЕ для поля «Референс», если выше есть более точная ссылка):",
+        _format_results(general_results) if general_results else "(нет дополнительных материалов)",
+    ]
+    return "\n".join(parts)
 
 
 async def generate_trends(niche: str, market_key: str, context: str) -> str:
@@ -264,11 +291,17 @@ async def build_market_report(niche: str, market_key: str) -> str:
     market = MARKETS[market_key]
     if market_key == "us":
         niche_en = await translate_niche(niche)
-        query = market["query_tpl"].format(niche_en=niche_en)
+        video_query = market["video_query_tpl"].format(niche_en=niche_en)
+        context_query = market["context_query_tpl"].format(niche_en=niche_en)
     else:
-        query = market["query_tpl"].format(niche=niche)
-    results = await tavily_search(query)
-    context = build_context(results)
+        video_query = market["video_query_tpl"].format(niche=niche)
+        context_query = market["context_query_tpl"].format(niche=niche)
+
+    video_results, general_results = await asyncio.gather(
+        tavily_search(video_query, max_results=10, include_domains=market["video_domains"], country=market["country"]),
+        tavily_search(context_query, max_results=6, country=market["country"]),
+    )
+    context = build_context(video_results, general_results)
     body = await generate_trends(niche, market_key, context)
     return f"{market['header']}\nНиша: {niche}\n\n{body}"
 
@@ -304,16 +337,30 @@ async def keep_typing(chat_id: int, stop_event: asyncio.Event) -> None:
             pass
 
 
-async def send_sequence(chat_id: int, messages: list[str], delay: float = 1.3) -> None:
-    """Отправляет сообщения одно за другим с небольшой паузой — вместо одной стены текста."""
-    for i, text in enumerate(messages):
+async def send_batch(chat_id: int, batch: list[str], delay: float = 1.0) -> None:
+    """Отправляет несколько сообщений подряд (например, части одной подборки) с небольшой паузой."""
+    for i, text in enumerate(batch):
         await bot.send_message(chat_id, text)
-        if i < len(messages) - 1:
+        if i < len(batch) - 1:
             try:
                 await bot.send_chat_action(chat_id, "typing")
             except Exception:
                 pass
             await asyncio.sleep(delay)
+
+
+CONTINUE_KEYBOARD = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="✅ Да, продолжаем", callback_data="continue")]]
+)
+
+
+async def send_gate(chat_id: int) -> None:
+    """Присылает кнопку «Продолжаем?» — следующая часть уходит только по нажатию."""
+    await bot.send_message(chat_id, "Продолжаем?", reply_markup=CONTINUE_KEYBOARD)
+
+
+# user_id -> очередь оставшихся «пачек» сообщений, которые ждут нажатия кнопки «Продолжаем»
+PENDING: dict[int, list[list[str]]] = {}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -383,21 +430,45 @@ async def on_message(message: Message):
     used_now = use_quota(user_id, niche)
     remaining = max(DAILY_LIMIT - used_now, 0)
 
-    sequence: list[str] = []
-    sequence.extend(split_message(ru_report))
-    sequence.append("Продолжаем?")
-    sequence.extend(split_message(us_report))
-    sequence.append("Продолжаем?")
-    sequence.append(GENIE_PITCH)
     if remaining > 0:
-        sequence.append(
+        follow_up = (
             "Хочешь ещё подборку трендов? По этой же нише или по другой — просто напиши 🙂\n"
             f"Осталось подборок сегодня: {remaining}/{DAILY_LIMIT}."
         )
     else:
-        sequence.append(f"На сегодня лимит подборок исчерпан ({DAILY_LIMIT}/{DAILY_LIMIT}). Возвращайся завтра 🙂")
+        follow_up = f"На сегодня лимит подборок исчерпан ({DAILY_LIMIT}/{DAILY_LIMIT}). Возвращайся завтра 🙂"
 
-    await send_sequence(message.chat.id, sequence)
+    batch_ru = split_message(ru_report)
+    batch_us = split_message(us_report)
+    batch_final = [GENIE_PITCH, follow_up]
+
+    # Показываем сразу только первую подборку. Остальное — в очереди, ждёт нажатия кнопки.
+    PENDING[user_id] = [batch_us, batch_final]
+    await send_batch(message.chat.id, batch_ru)
+    await send_gate(message.chat.id)
+
+
+@dp.callback_query(F.data == "continue")
+async def on_continue(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    queue = PENDING.get(user_id)
+    if not queue:
+        await bot.send_message(callback.message.chat.id, "Эта подборка уже устарела — напиши нишу ещё раз 🙂")
+        return
+
+    batch = queue.pop(0)
+    await send_batch(callback.message.chat.id, batch)
+
+    if queue:
+        await send_gate(callback.message.chat.id)
+    else:
+        PENDING.pop(user_id, None)
 
 
 async def main():
